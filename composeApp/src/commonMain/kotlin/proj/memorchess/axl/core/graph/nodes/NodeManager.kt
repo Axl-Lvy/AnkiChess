@@ -1,8 +1,11 @@
 package proj.memorchess.axl.core.graph.nodes
 
 import com.diamondedge.logging.logging
+import kotlinx.datetime.Clock
+import kotlinx.datetime.LocalDate
+import kotlinx.datetime.TimeZone
+import kotlinx.datetime.todayIn
 import proj.memorchess.axl.core.data.DatabaseHolder
-import proj.memorchess.axl.core.data.IStoredMove
 import proj.memorchess.axl.core.data.IStoredNode
 import proj.memorchess.axl.core.data.PositionKey
 import proj.memorchess.axl.core.data.StoredMove
@@ -21,9 +24,11 @@ object NodeManager {
    */
   fun createRootNode(): Node {
     val position = Game().position.toImmutablePosition()
-    val rootNode = Node(position)
-    val newNodeMoves = nodeCache.getOrPut(position) { PreviousAndNextMoves() }
-    rootNode.linkedMoves.nextMoves.addAll(newNodeMoves.nextMoves)
+    val rootNodeMoves = nodeCache.getOrPut(position) { PreviousAndNextMoves() }
+    check(rootNodeMoves.previousMoves.isEmpty()) {
+      "Root node should not have previous moves, but found: ${rootNodeMoves.previousMoves}"
+    }
+    val rootNode = Node(position, rootNodeMoves)
     return rootNode
   }
 
@@ -37,11 +42,16 @@ object NodeManager {
    */
   fun createNode(game: Game, previous: Node, move: String): Node {
     val previousNodeMoves = nodeCache.getOrPut(previous.position) { PreviousAndNextMoves() }
-    val storedMove = StoredMove(previous.position, game.position.toImmutablePosition(), move)
-    previousNodeMoves.addNextMove(storedMove)
+    val storedMove =
+      previousNodeMoves.nextMoves.getOrPut(move) {
+        StoredMove(previous.position, game.position.toImmutablePosition(), move)
+      }
     val newNodeLinkedMoves =
       nodeCache.getOrPut(game.position.toImmutablePosition()) { PreviousAndNextMoves() }
-    newNodeLinkedMoves.addPreviousMove(storedMove)
+    val previouslyStoredPreviousNode = newNodeLinkedMoves.addPreviousMove(storedMove)
+    if (previouslyStoredPreviousNode != null && previouslyStoredPreviousNode != storedMove) {
+      LOGGER.w { "Overwriting previous move: $previouslyStoredPreviousNode with $storedMove" }
+    }
     val newNode =
       Node(
         game.position.toImmutablePosition(),
@@ -56,7 +66,7 @@ object NodeManager {
     nodeCache.clearNextMoves(positionKey)
   }
 
-  suspend fun clearPreviousMove(positionKey: PositionKey, move: IStoredMove) {
+  suspend fun clearPreviousMove(positionKey: PositionKey, move: StoredMove) {
     nodeCache.clearPreviousMove(positionKey, move)
   }
 
@@ -74,7 +84,11 @@ object NodeManager {
  * position keys and their associated moves.
  */
 private object NodeCache {
+  private lateinit var todayDate: LocalDate
+
   private var databaseRetrieved = false
+
+  private val movesToLearn = mutableListOf<StoredMove>()
 
   /** Cache to prevent creating a node twice. */
   private val movesCache = mutableMapOf<PositionKey, PreviousAndNextMoves>()
@@ -120,8 +134,8 @@ private object NodeCache {
    * @param positionKey The position key to clear the previous move for.
    * @param move The move to clear.
    */
-  suspend fun clearPreviousMove(positionKey: PositionKey, move: IStoredMove) {
-    movesCache[positionKey]?.previousMoves?.remove(move)
+  suspend fun clearPreviousMove(positionKey: PositionKey, move: StoredMove) {
+    movesCache[positionKey]?.previousMoves?.remove(move.move)
     LOGGER.i { "Cleared previous move $move for position: $positionKey" }
     DatabaseHolder.getDatabase().deleteMove(positionKey.fenRepresentation, move.move)
   }
@@ -138,10 +152,20 @@ private object NodeCache {
       LOGGER.i { "Database already retrieved." }
       return
     }
+    movesToLearn.clear()
+    todayDate = Clock.System.todayIn(TimeZone.currentSystemDefault())
     val allPosition: List<IStoredNode> = (DatabaseHolder.getDatabase()).getAllPositions()
-    allPosition.forEach {
-      movesCache.getOrPut(it.positionKey) { PreviousAndNextMoves(it.previousMoves, it.nextMoves) }
-      LOGGER.i { "Retrieved node: ${it.positionKey}" }
+    allPosition.forEach { position ->
+      movesCache.getOrPut(position.positionKey) {
+        PreviousAndNextMoves(position.previousMoves, position.nextMoves)
+      }
+      position.nextMoves.forEach {
+        if (it.nextTrainedDate < todayDate) {
+          movesToLearn.add(it)
+          LOGGER.i { "Move $it has to be learned today" }
+        }
+      }
+      LOGGER.i { "Retrieved node: ${position.positionKey}" }
     }
     databaseRetrieved = true
   }
